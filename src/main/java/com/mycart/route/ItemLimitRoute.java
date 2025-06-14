@@ -1,0 +1,142 @@
+package com.mycart.route;
+
+import com.mycart.model.ReviewXml;
+import org.apache.camel.LoggingLevel;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.jackson.JacksonDataFormat;
+import org.apache.camel.component.mongodb.MongoDbConstants;
+import org.apache.camel.converter.jaxb.JaxbDataFormat;
+import com.mycart.model.TrendXml;
+import com.mycart.model.StoreJson;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+@Component
+public class ItemLimitRoute extends RouteBuilder {
+    private static final Logger logger = LoggerFactory.getLogger(ItemLimitRoute.class);
+
+    @Override
+    public void configure() throws Exception {
+        onException(Exception.class)
+                .handled(true)
+                .log(LoggingLevel.ERROR, "Failed to write file: ${header.CamelFileName}, error: ${exception.message}");
+
+
+        JaxbDataFormat trendXmlFormat = new JaxbDataFormat(TrendXml.class.getPackage().getName());
+        JaxbDataFormat reviewXmlFormat = new JaxbDataFormat(ReviewXml.class.getPackage().getName());
+        JacksonDataFormat jsonFormat = new JacksonDataFormat(StoreJson.class);
+
+        String mongoUri = "mongodb:mongoClient?database={{app.mongodb.database}}";
+
+        // Main route for scheduling and fetching items
+        from("quartz://fileExport?cron={{app.scheduler.cron}}")
+                .routeId("fileExport")
+                .bean("itemProcessor", "setCurrentTimestamp")
+                .to("direct:fetchControlRef")
+                .to("direct:processItems")
+                .log(LoggingLevel.INFO, "File export completed");
+
+        from("direct:fetchControlRef")
+                .routeId("fetchControlRef")
+                .bean("controlRefProcessor", "fetchControlRefs")
+                .log(LoggingLevel.INFO, "Fetched controlRefMap with ${exchangeProperty.controlRefMap.size()} entries");
+
+        from("direct:processItems")
+                .routeId("processItems")
+                .bean("itemProcessor", "prepareItemQuery")
+                .setHeader(MongoDbConstants.LIMIT, constant(Integer.parseInt(getContext().resolvePropertyPlaceholders("{{app.records.processLimit}}"))))
+                .to(mongoUri + "&collection={{app.item.collection}}&operation=findAll")
+                .bean("itemProcessor", "filterValidItems")
+                .bean("itemProcessor", "logFetchedItems")
+                .split(body()).parallelProcessing()
+                .bean("itemProcessor", "enrichWithCategory")
+                .log(LoggingLevel.DEBUG, "Executing category query for item ${exchangeProperty.itemId} on ${header.CamelMongoDbDatabase}.${header.CamelMongoDbCollection}")
+                .to(mongoUri + "&collection={{app.category.collection}}&operation=findOneByQuery&outputType=Document")
+                .bean("itemProcessor", "processCategoryQuery")
+                .bean("itemProcessor", "mapItemData")
+                .multicast().parallelProcessing()
+                .to("direct:writeTrendXml", "direct:writeReviewXml", "direct:writeStoreJson")
+                .end()
+                .to("direct:updateControlRef")
+                .end();
+
+        // Throttled route for file writes
+
+        from("direct:writeToFile")
+                .routeId("writeToFile")
+                .throttle(100).timePeriodMillis(60000).asyncDelayed()
+                .choice()
+                .when(simple("${header.OutputFolder} == 'trend'"))
+                .to("file://{{app.output.item-trend-analyzer}}?fileName=${header.CamelFileName}&autoCreate=true")
+                .when(simple("${header.OutputFolder} == 'review'"))
+                .to("file://{{app.output.item-review-aggregator}}?fileName=${header.CamelFileName}&autoCreate=true")
+                .when(simple("${header.OutputFolder} == 'store'"))
+                .to("file://{{app.output.storefront-app}}?fileName=${header.CamelFileName}&autoCreate=true")
+                .otherwise()
+                .log(LoggingLevel.ERROR, "Unknown OutputFolder: ${header.OutputFolder}")
+                .stop()
+                .end()
+                .log(LoggingLevel.INFO, "Saved file: ${header.CamelFileName}");
+
+        // Routes to prepare files and route to throttled file write
+        from("direct:writeTrendXml")
+                .routeId("writeTrendXml")
+                .bean("itemProcessor", "prepareTrendXml")
+                .choice()
+                .when(body().isNotNull())
+                .doTry()
+                .marshal(trendXmlFormat)
+                .to("direct:writeToFile")
+                .doCatch(Exception.class)
+                .log(LoggingLevel.ERROR, "Failed to marshal trend XML: ${header.CamelFileName}, error: ${exception.message}")
+                .endDoTry()
+                .endChoice()
+                .when(body().isNull())
+                .log(LoggingLevel.WARN, "Skipping null trend XML")
+                .endChoice();
+
+        from("direct:writeReviewXml")
+                .routeId("writeReviewXml")
+                .bean("itemProcessor", "prepareReviewXml")
+                .choice()
+                .when(body().isNotNull())
+                .doTry()
+                .marshal(reviewXmlFormat)
+                .to("direct:writeToFile")
+                .doCatch(Exception.class)
+                .log(LoggingLevel.ERROR, "Failed to marshal review XML: ${header.CamelFileName}, error: ${exception.message}")
+                .endDoTry()
+                .endChoice()
+                .when(body().isNull())
+                .log(LoggingLevel.WARN, "Skipping null review XML")
+                .endChoice();
+
+        from("direct:writeStoreJson")
+                .routeId("writeStoreJson")
+                .bean("itemProcessor", "prepareStoreJson")
+                .choice()
+                .when(body().isNotNull())
+                .doTry()
+                .marshal(jsonFormat)
+                .to("direct:writeToFile")
+                .doCatch(Exception.class)
+                .log(LoggingLevel.ERROR, "Failed to marshal store JSON: ${header.CamelFileName}, error: ${exception.message}")
+                .endDoTry()
+                .endChoice()
+                .when(body().isNull())
+                .log(LoggingLevel.WARN, "Skipping null store JSON")
+                .endChoice();
+
+        from("direct:updateControlRef")
+                .routeId("updateControlRef")
+                .bean("controlRefProcessor", "updateControlRef")
+                .choice()
+                .when(body().isNotNull())
+                .to(mongoUri + "&collection={{app.control.collection}}&operation=save")
+                .log(LoggingLevel.INFO, "controlRef updated for item: ${exchangeProperty.itemId}")
+                .endChoice()
+                .when(body().isNull())
+                .log(LoggingLevel.WARN, "Skipped controlRef update for item: ${exchangeProperty.itemId} (null body)")
+                .endChoice();
+    }
+}
