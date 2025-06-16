@@ -1,4 +1,5 @@
 package com.mycart.processor;
+
 import org.apache.camel.Exchange;
 import org.bson.Document;
 import com.mycart.model.ReviewXml;
@@ -12,7 +13,7 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
-@Component
+@Component("itemProcessor")
 public class ItemProcessor {
 
     private static final Logger logger = LoggerFactory.getLogger(ItemProcessor.class);
@@ -32,43 +33,55 @@ public class ItemProcessor {
         Document query = new Document();
 
         if (controlRefMap != null && !controlRefMap.isEmpty()) {
-            Date latestProcessTs = Collections.max(controlRefMap.values());
-            String latestProcessTsStr;
-            synchronized (FORMATTER) {
-                latestProcessTsStr = FORMATTER.format(latestProcessTs);
+            Date lastProcessTs = controlRefMap.get("global");
+            if (lastProcessTs != null) {
+                String lastProcessTsStr;
+                synchronized (FORMATTER) {
+                    lastProcessTsStr = FORMATTER.format(lastProcessTs);
+                }
+                query.append("lastUpdateDate", new Document("$gt", lastProcessTsStr));
+                logger.debug("Prepared item query with lastUpdateDate > {}", lastProcessTsStr);
+            } else {
+                logger.warn("No lastProcessTs in controlRefMap, fetching all items");
             }
-            query.append("lastUpdateDate", new Document("$gt", latestProcessTsStr));
-            logger.debug("Prepared item query with lastUpdateDate > {} based on controlRefMap with {} entries",
-                    latestProcessTsStr, controlRefMap.size());
         } else {
             logger.warn("controlRefMap is null or empty, fetching all items");
         }
 
         exchange.getIn().setBody(query);
-        logger.debug("Prepared item query: {}", query.toJson());
+        logger.info("Prepared item query: {}", query.toJson());
+    }
+
+    public void validateItemList(Exchange exchange) {
+        Object body = exchange.getIn().getBody();
+        logger.debug("validateItemList received body type: {}, value: {}",
+                body != null ? body.getClass().getName() : "null", body);
+        if (!(body instanceof List)) {
+            logger.warn("Unexpected findAll result type: {}, converting to empty list",
+                    body != null ? body.getClass().getName() : "null");
+            exchange.getIn().setBody(new ArrayList<>());
+        }
     }
 
     @SuppressWarnings("unchecked")
     public void filterValidItems(Exchange exchange) {
         Object body = exchange.getIn().getBody();
+        logger.debug("filterValidItems received body type: {}, value: {}",
+                body != null ? body.getClass().getName() : "null", body);
+
         List<Document> items = body instanceof List ? (List<Document>) body : new ArrayList<>();
         Map<String, Date> controlRefMap = exchange.getProperty("controlRefMap", Map.class);
         List<Document> validItems = new ArrayList<>();
 
         if (items.isEmpty()) {
-            logger.info("No items fetched from MongoDB, query: {}", exchange.getIn().getBody(Document.class) != null ?
-                    exchange.getIn().getBody(Document.class).toJson() : "null");
+            logger.info("No items fetched from MongoDB, query: {}",
+                    exchange.getIn().getBody(Document.class) != null ?
+                            exchange.getIn().getBody(Document.class).toJson() : "null");
             exchange.getIn().setBody(validItems);
             return;
         }
 
-        if (controlRefMap == null || controlRefMap.isEmpty()) {
-            logger.warn("controlRefMap is null or empty, processing all items as new");
-            validItems.addAll(items);
-            exchange.getIn().setBody(validItems);
-            logger.info("Fetched {} items, all considered valid (no controlRef map)", items.size());
-            return;
-        }
+        Date lastProcessTs = (controlRefMap != null && !controlRefMap.isEmpty()) ? controlRefMap.get("global") : null;
 
         for (Document item : items) {
             String id = item.getString("_id");
@@ -89,7 +102,6 @@ public class ItemProcessor {
                 continue;
             }
 
-            Date lastProcessTs = controlRefMap.get(id);
             if (lastProcessTs == null || lastUpdateDate.after(lastProcessTs)) {
                 validItems.add(item);
                 logger.info("Valid item: {} with lastUpdateDate: {} (lastProcessTs: {})",
@@ -114,6 +126,33 @@ public class ItemProcessor {
             logger.info("Processing {} items: {}", items.size(), itemSummaries);
         } else {
             logger.info("No items to process after filtering");
+        }
+    }
+
+    public void storeOriginalExchange(Exchange exchange) {
+        exchange.setProperty("originalExchange", exchange.getIn().copy());
+        logger.debug("Stored original exchange for currentTs: {}", exchange.getProperty("currentTs"));
+    }
+
+    public void restoreOriginalExchange(Exchange exchange) {
+        Exchange original = exchange.getProperty("originalExchange", Exchange.class);
+        if (original != null) {
+            exchange.getIn().setBody(original.getIn().getBody());
+            exchange.getProperties().putAll(original.getProperties());
+            logger.debug("Restored original exchange for currentTs: {}", exchange.getProperty("currentTs"));
+        } else {
+            logger.warn("No original exchange to restore for currentTs: {}", exchange.getProperty("currentTs"));
+        }
+    }
+
+    public void validateCategoryResult(Exchange exchange) {
+        Object body = exchange.getIn().getBody();
+        String itemId = exchange.getProperty("itemId", String.class);
+        logger.debug("validateCategoryResult for item {}: body type={}, value={}",
+                itemId, body != null ? body.getClass().getName() : "null", body);
+        if (body instanceof List) {
+            logger.warn("Unexpected findOneByQuery result type: List, value: {}, setting to null for item {}", body, itemId);
+            exchange.getIn().setBody(null);
         }
     }
 
@@ -150,17 +189,8 @@ public class ItemProcessor {
         if (body instanceof Document doc) {
             resultDoc = doc;
             logger.debug("Category query result for item {} (categoryId: {}): {}", itemId, categoryId, doc.toJson());
-        } else if (body instanceof List<?> list) {
-            if (!list.isEmpty() && list.get(0) instanceof Document doc) {
-                resultDoc = doc;
-                logger.debug("Category query result for item {} (categoryId: {}): found document in list: {}",
-                        itemId, categoryId, doc.toJson());
-            } else {
-                logger.warn("Category query for item {} (categoryId: {}): empty or invalid list: {}",
-                        itemId, categoryId, list);
-            }
         } else {
-            logger.warn("Category query for item {} (categoryId: {}): unexpected body type {}, value: {}",
+            logger.warn("Category query for item {} (categoryId: {}): unexpected body type {}, value: {}, setting to default",
                     itemId, categoryId, body != null ? body.getClass().getName() : "null", body);
         }
 
@@ -258,41 +288,44 @@ public class ItemProcessor {
     }
 
     public void prepareTrendXml(Exchange exchange) {
-        com.mycart.model.TrendXml trendXml = exchange.getProperty("trendXml", com.mycart.model.TrendXml.class);
-        if (trendXml == null || trendXml.getItemId() == null) {
-            logger.warn("trendXml is null or invalid, skipping");
+        TrendXml trendXml = exchange.getProperty("trendXml", TrendXml.class);
+        String itemId = exchange.getProperty("itemId", String.class);
+        if (trendXml == null || trendXml.getItemId() == null || itemId == null) {
+            logger.warn("trendXml or itemId is null or invalid, skipping");
             exchange.getIn().setBody(null);
             return;
         }
-        exchange.getIn().setHeader("CamelFileName", String.format("trend-%s-%s.xml", trendXml.getItemId(), exchange.getProperty("currentTs").toString().replaceAll("[^0-9]", "")));
-        exchange.getIn().setHeader("OutputFolder", "trend");
+        String timestamp = exchange.getProperty("currentTs", String.class).replaceAll("[^0-9]", "");
+        exchange.getIn().setHeader("CamelFileName", String.format("trend-%s-%s.xml", itemId, timestamp));
         exchange.getIn().setBody(trendXml);
         logger.debug("Prepared trend XML for item: {}", trendXml.getItemId());
     }
 
-    public void prepareReviewXml(Exchange exchange) {
-        com.mycart.model.ReviewXml reviewXml = exchange.getProperty("reviewXml", com.mycart.model.ReviewXml.class);
-        if (reviewXml == null || reviewXml.getItemId() == null) {
-            logger.warn("reviewXml is null or invalid, skipping");
-            exchange.getIn().setBody(null);
-            return;
-        }
-        exchange.getIn().setHeader("CamelFileName", String.format("review-%s-%s.xml", reviewXml.getItemId(), exchange.getProperty("currentTs").toString().replaceAll("[^0-9]", "")));
-        exchange.getIn().setHeader("OutputFolder", "review");
-        exchange.getIn().setBody(reviewXml);
-        logger.debug("Prepared review XML for item: {}", reviewXml.getItemId());
-    }
-
     public void prepareStoreJson(Exchange exchange) {
-        com.mycart.model.StoreJson storeJson = exchange.getProperty("storeJson", com.mycart.model.StoreJson.class);
-        if (storeJson == null || storeJson.get_id() == null) {
-            logger.warn("storeJson is null or invalid, skipping");
+        StoreJson storeJson = exchange.getProperty("storeJson", StoreJson.class);
+        String itemId = exchange.getProperty("itemId", String.class);
+        if (storeJson == null || storeJson.get_id() == null || itemId == null) {
+            logger.warn("storeJson or itemId is null or invalid, skipping");
             exchange.getIn().setBody(null);
             return;
         }
-        exchange.getIn().setHeader("CamelFileName", String.format("storefront-%s-%s.json", storeJson.get_id(), exchange.getProperty("currentTs").toString().replaceAll("[^0-9]", "")));
-        exchange.getIn().setHeader("OutputFolder", "store");
+        String timestamp = exchange.getProperty("currentTs", String.class).replaceAll("[^0-9]", "");
+        exchange.getIn().setHeader("CamelFileName", String.format("storefront-%s-%s.json", itemId, timestamp));
         exchange.getIn().setBody(storeJson);
         logger.debug("Prepared store JSON for item: {}", storeJson.get_id());
+    }
+
+    public void prepareReviewXml(Exchange exchange) {
+        ReviewXml reviewXml = exchange.getProperty("reviewXml", ReviewXml.class);
+        String itemId = exchange.getProperty("itemId", String.class);
+        if (reviewXml == null || reviewXml.getItemId() == null || itemId == null) {
+            logger.warn("reviewXml or itemId is null or invalid, skipping");
+            exchange.getIn().setBody(null);
+            return;
+        }
+        String timestamp = exchange.getProperty("currentTs", String.class).replaceAll("[^0-9]", "");
+        exchange.getIn().setHeader("CamelFileName", String.format("review-%s-%s.xml", itemId, timestamp));
+        exchange.getIn().setBody(reviewXml);
+        logger.debug("Prepared review XML for item: {}", reviewXml.getItemId());
     }
 }
