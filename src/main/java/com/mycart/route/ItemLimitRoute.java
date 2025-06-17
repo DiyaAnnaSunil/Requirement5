@@ -13,6 +13,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
+import java.nio.file.Paths;
+
 @Component
 public class ItemLimitRoute extends RouteBuilder {
     private static final Logger logger = LoggerFactory.getLogger(ItemLimitRoute.class);
@@ -39,8 +42,12 @@ public class ItemLimitRoute extends RouteBuilder {
                 .log(LoggingLevel.DEBUG, "Before processItems, currentTs: ${exchangeProperty.currentTs}")
                 .to("direct:processItems")
                 .log(LoggingLevel.DEBUG, "After processItems, currentTs: ${exchangeProperty.currentTs}")
+                .choice()
+                .when(simple("${exchangeProperty.itemsProcessed} == true"))
                 .to("direct:updateControlRef")
-                .log(LoggingLevel.INFO, "File export completed");
+                .log(LoggingLevel.INFO, "Proceeding to update controlRef")
+                .endChoice()
+                .log(LoggingLevel.INFO, "File export completed, itemsProcessed: ${exchangeProperty.itemsProcessed}");
 
         from("direct:fetchControlRef")
                 .routeId("fetchControlRef")
@@ -61,7 +68,10 @@ public class ItemLimitRoute extends RouteBuilder {
                 .bean("itemProcessor", "validateItemList")
                 .bean("itemProcessor", "filterValidItems")
                 .bean("itemProcessor", "logFetchedItems")
+                .choice()
+                .when(simple("${body} != null && ${body.size()} > 0"))
                 .bean("itemProcessor", "storeOriginalExchange")
+                .setProperty("itemsProcessed", constant(true))
                 .split(body())
                 .log(LoggingLevel.DEBUG, "Processing item ${exchangeProperty.itemId}")
                 .bean("itemProcessor", "enrichWithCategory")
@@ -73,12 +83,10 @@ public class ItemLimitRoute extends RouteBuilder {
                 .doTry()
                 .bean("itemProcessor", "prepareTrendXml")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .marshal(trendXmlFormat)
                 .setHeader("OutputFolder", constant("trend"))
                 .to("direct:writeToFile")
-                .otherwise()
-                .log(LoggingLevel.WARN, "Skipping null trend XML for item ${exchangeProperty.itemId}")
                 .endChoice()
                 .endDoTry()
                 .doCatch(Exception.class)
@@ -87,12 +95,10 @@ public class ItemLimitRoute extends RouteBuilder {
                 .doTry()
                 .bean("itemProcessor", "prepareReviewXml")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .marshal(reviewXmlFormat)
                 .setHeader("OutputFolder", constant("review"))
                 .to("direct:writeToFile")
-                .otherwise()
-                .log(LoggingLevel.WARN, "Skipping null review XML for item ${exchangeProperty.itemId}")
                 .endChoice()
                 .endDoTry()
                 .doCatch(Exception.class)
@@ -101,12 +107,10 @@ public class ItemLimitRoute extends RouteBuilder {
                 .doTry()
                 .bean("itemProcessor", "prepareStoreJson")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .marshal(jsonFormat)
                 .setHeader("OutputFolder", constant("store"))
                 .to("direct:writeToFile")
-                .otherwise()
-                .log(LoggingLevel.WARN, "Skipping null store JSON for item ${exchangeProperty.itemId}")
                 .endChoice()
                 .endDoTry()
                 .doCatch(Exception.class)
@@ -116,83 +120,98 @@ public class ItemLimitRoute extends RouteBuilder {
                 .end()
                 .log(LoggingLevel.DEBUG, "Completed processItems split, currentTs: ${exchangeProperty.currentTs}")
                 .bean("itemProcessor", "restoreOriginalExchange")
+                .endChoice()
+                .when(simple("${body} == null || ${body.size()} == 0"))
+                .setProperty("itemsProcessed", constant(false))
+                .log(LoggingLevel.INFO, "No valid items to process, skipping split")
+                .endChoice()
                 .endDoTry()
                 .doCatch(Exception.class)
                 .log(LoggingLevel.ERROR, "Failed processing items: ${exception.message}, currentTs: ${exchangeProperty.currentTs}")
+                .setProperty("itemsProcessed", constant(false))
                 .end();
 
         from("direct:writeToFile")
                 .routeId("writeToFile")
                 .doTry()
+                .throttle(100).timePeriodMillis(60000).asyncDelayed()
+                .process(exchange -> {
+                    String fileName = exchange.getIn().getHeader("CamelFileName", String.class);
+                    String outputFolder = exchange.getIn().getHeader("OutputFolder", String.class);
+                    String basePath = switch (outputFolder) {
+                        case "trend" -> "{{app.output.item-trend-analyzer}}";
+                        case "review" -> "{{app.output.item-review-aggregator}}";
+                        case "store" -> "{{app.output.storefront-app}}";
+                        default -> throw new IllegalArgumentException("Invalid OutputFolder: " + outputFolder);
+                    };
+                    String resolvedPath = getContext().resolvePropertyPlaceholders(basePath);
+                    String fullPath = resolvedPath + "/" + fileName;
+                    boolean fileExists = Files.exists(Paths.get(fullPath));
+                    exchange.setProperty("fileExisted", fileExists);
+                    logger.debug("Checked file existence for {}: {}", fullPath, fileExists);
+                })
                 .choice()
                 .when(simple("${header.OutputFolder} == 'trend'"))
-                .to("file://{{app.output.item-trend-analyzer}}?fileName=${header.CamelFileName}&fileExist=Ignore")
+                .to("file://{{app.output.item-trend-analyzer}}?fileName=${header.CamelFileName}&fileExist=Override")
                 .when(simple("${header.OutputFolder} == 'review'"))
-                .to("file://{{app.output.item-review-aggregator}}?fileName=${header.CamelFileName}&fileExist=Ignore")
+                .to("file://{{app.output.item-review-aggregator}}?fileName=${header.CamelFileName}&fileExist=Override")
                 .when(simple("${header.OutputFolder} == 'store'"))
-                .to("file://{{app.output.storefront-app}}?fileName=${header.CamelFileName}&fileExist=Ignore")
-                .otherwise()
-                .log(LoggingLevel.ERROR, "Unknown OutputFolder: ${header.CamelFileName}")
-                .stop()
-                .end()
-                .log(LoggingLevel.INFO, "Saved file: ${header.CamelFileName}")
+                .to("file://{{app.output.storefront-app}}?fileName=${header.CamelFileName}&fileExist=Override")
+                .endChoice()
+                .choice()
+                .when(simple("${exchangeProperty.fileExisted} == true"))
+                .log(LoggingLevel.INFO, "Overwrote file: ${header.CamelFileName}")
+                .when(simple("${exchangeProperty.fileExisted} == false"))
+                .log(LoggingLevel.INFO, "Created new file: ${header.CamelFileName}")
+                .endChoice()
                 .endDoTry()
                 .doCatch(Exception.class)
-                .log(LoggingLevel.ERROR, "Failed to write file: ${header.CamelFileName}, error: ${exception.message}")
+                .log(LoggingLevel.ERROR, "Failed to overwrite file: ${header.CamelFileName}, error: ${exception.message}")
                 .end();
 
         from("direct:writeTrendXml")
                 .routeId("writeTrendXml")
                 .bean("itemProcessor", "prepareTrendXml")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .doTry()
                 .marshal(trendXmlFormat)
                 .setHeader("OutputFolder", constant("trend"))
                 .to("direct:writeToFile")
                 .endDoTry()
                 .doCatch(Exception.class)
-                .log(LoggingLevel.ERROR, "Failed to write trend XML: ${header.CamelFileName}, error: ${exception.message}")
+                .log(LoggingLevel.ERROR, "Failed to overwrite trend XML: ${header.CamelFileName}, error: ${exception.message}")
                 .end()
-                .endChoice()
-                .when(body().isNull())
-                .log(LoggingLevel.WARN, "Skipping null trend XML")
                 .endChoice();
 
         from("direct:writeReviewXml")
                 .routeId("writeReviewXml")
                 .bean("itemProcessor", "prepareReviewXml")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .doTry()
                 .marshal(reviewXmlFormat)
                 .setHeader("OutputFolder", constant("review"))
                 .to("direct:writeToFile")
                 .endDoTry()
                 .doCatch(Exception.class)
-                .log(LoggingLevel.ERROR, "Failed to write review XML: ${header.CamelFileName}, error: ${exception.message}")
+                .log(LoggingLevel.ERROR, "Failed to overwrite review XML: ${header.CamelFileName}, error: ${exception.message}")
                 .end()
-                .endChoice()
-                .when(body().isNull())
-                .log(LoggingLevel.WARN, "Skipping null review XML")
                 .endChoice();
 
         from("direct:writeStoreJson")
                 .routeId("writeStoreJson")
                 .bean("itemProcessor", "prepareStoreJson")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .doTry()
                 .marshal(jsonFormat)
                 .setHeader("OutputFolder", constant("store"))
                 .to("direct:writeToFile")
                 .endDoTry()
                 .doCatch(Exception.class)
-                .log(LoggingLevel.ERROR, "Failed to write store JSON: ${header.CamelFileName}, error: ${exception.message}")
+                .log(LoggingLevel.ERROR, "Failed to overwrite store JSON: ${header.CamelFileName}, error: ${exception.message}")
                 .end()
-                .endChoice()
-                .when(body().isNull())
-                .log(LoggingLevel.WARN, "Skipping null store JSON")
                 .endChoice();
 
         from("direct:updateControlRef")
@@ -200,7 +219,7 @@ public class ItemLimitRoute extends RouteBuilder {
                 .log(LoggingLevel.DEBUG, "Starting controlRef update with currentTs: ${exchangeProperty.currentTs}")
                 .bean("controlRefProcessor", "updateControlRef")
                 .choice()
-                .when(body().isNotNull())
+                .when(simple("${body} != null"))
                 .doTry()
                 .to(mongoUri + "&collection={{app.control.collection}}&operation=save")
                 .log(LoggingLevel.INFO, "controlRef updated with lastProcessTs: ${exchangeProperty.currentTs}")
@@ -208,9 +227,6 @@ public class ItemLimitRoute extends RouteBuilder {
                 .doCatch(Exception.class)
                 .log(LoggingLevel.ERROR, "Failed to save controlRef to MongoDB: ${exception.message}")
                 .end()
-                .endChoice()
-                .when(body().isNull())
-                .log(LoggingLevel.ERROR, "Skipped controlRef update due to null body, currentTs: ${exchangeProperty.currentTs}")
                 .endChoice();
     }
 }

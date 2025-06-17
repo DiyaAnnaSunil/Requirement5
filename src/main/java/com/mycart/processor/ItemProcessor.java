@@ -82,6 +82,11 @@ public class ItemProcessor {
         }
 
         Date lastProcessTs = (controlRefMap != null && !controlRefMap.isEmpty()) ? controlRefMap.get("global") : null;
+        if (lastProcessTs == null) {
+            logger.warn("No lastProcessTs available, no items will be processed");
+            exchange.getIn().setBody(validItems);
+            return;
+        }
 
         for (Document item : items) {
             String id = item.getString("_id");
@@ -102,10 +107,10 @@ public class ItemProcessor {
                 continue;
             }
 
-            if (lastProcessTs == null || lastUpdateDate.after(lastProcessTs)) {
+            if (lastUpdateDate.after(lastProcessTs)) {
                 validItems.add(item);
                 logger.info("Valid item: {} with lastUpdateDate: {} (lastProcessTs: {})",
-                        id, lastUpdateDateStr, lastProcessTs != null ? FORMATTER.format(lastProcessTs) : "none");
+                        id, lastUpdateDateStr, FORMATTER.format(lastProcessTs));
             } else {
                 logger.debug("Skipping item {}: lastUpdateDate {} not after lastProcessTs {}",
                         id, lastUpdateDateStr, FORMATTER.format(lastProcessTs));
@@ -295,8 +300,7 @@ public class ItemProcessor {
             exchange.getIn().setBody(null);
             return;
         }
-        String timestamp = exchange.getProperty("currentTs", String.class).replaceAll("[^0-9]", "");
-        exchange.getIn().setHeader("CamelFileName", String.format("trend-%s-%s.xml", itemId, timestamp));
+        exchange.getIn().setHeader("CamelFileName", String.format("trend-%s.xml", itemId));
         exchange.getIn().setBody(trendXml);
         logger.debug("Prepared trend XML for item: {}", trendXml.getItemId());
     }
@@ -309,8 +313,7 @@ public class ItemProcessor {
             exchange.getIn().setBody(null);
             return;
         }
-        String timestamp = exchange.getProperty("currentTs", String.class).replaceAll("[^0-9]", "");
-        exchange.getIn().setHeader("CamelFileName", String.format("storefront-%s-%s.json", itemId, timestamp));
+        exchange.getIn().setHeader("CamelFileName", String.format("storefront-%s.json", itemId));
         exchange.getIn().setBody(storeJson);
         logger.debug("Prepared store JSON for item: {}", storeJson.get_id());
     }
@@ -323,8 +326,7 @@ public class ItemProcessor {
             exchange.getIn().setBody(null);
             return;
         }
-        String timestamp = exchange.getProperty("currentTs", String.class).replaceAll("[^0-9]", "");
-        exchange.getIn().setHeader("CamelFileName", String.format("review-%s-%s.xml", itemId, timestamp));
+        exchange.getIn().setHeader("CamelFileName", String.format("review-%s.xml", itemId));
         exchange.getIn().setBody(reviewXml);
         logger.debug("Prepared review XML for item: {}", reviewXml.getItemId());
     }
