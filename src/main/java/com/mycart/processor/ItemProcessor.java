@@ -9,6 +9,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
@@ -54,13 +56,17 @@ public class ItemProcessor {
 
     public void validateItemList(Exchange exchange) {
         Object body = exchange.getIn().getBody();
-        logger.debug("validateItemList received body type: {}, value: {}",
-                body != null ? body.getClass().getName() : "null", body);
-        if (!(body instanceof List)) {
-            logger.warn("Unexpected findAll result type: {}, converting to empty list",
-                    body != null ? body.getClass().getName() : "null");
+        if (body == null) {
+            logger.warn("Item list is null, setting to empty list");
             exchange.getIn().setBody(new ArrayList<>());
+            return;
         }
+        if (!(body instanceof List)) {
+            logger.error("Item list is not a List, type: {}, value: {}", body.getClass().getName(), body);
+            exchange.getIn().setBody(new ArrayList<>());
+            return;
+        }
+        logger.debug("Validated item list, size: {}", ((List<?>) body).size());
     }
 
     @SuppressWarnings("unchecked")
@@ -82,11 +88,6 @@ public class ItemProcessor {
         }
 
         Date lastProcessTs = (controlRefMap != null && !controlRefMap.isEmpty()) ? controlRefMap.get("global") : null;
-        if (lastProcessTs == null) {
-            logger.warn("No lastProcessTs available, no items will be processed");
-            exchange.getIn().setBody(validItems);
-            return;
-        }
 
         for (Document item : items) {
             String id = item.getString("_id");
@@ -107,10 +108,10 @@ public class ItemProcessor {
                 continue;
             }
 
-            if (lastUpdateDate.after(lastProcessTs)) {
+            if (lastProcessTs == null || lastUpdateDate.after(lastProcessTs)) {
                 validItems.add(item);
                 logger.info("Valid item: {} with lastUpdateDate: {} (lastProcessTs: {})",
-                        id, lastUpdateDateStr, FORMATTER.format(lastProcessTs));
+                        id, lastUpdateDateStr, lastProcessTs != null ? FORMATTER.format(lastProcessTs) : "none");
             } else {
                 logger.debug("Skipping item {}: lastUpdateDate {} not after lastProcessTs {}",
                         id, lastUpdateDateStr, FORMATTER.format(lastProcessTs));
@@ -134,33 +135,6 @@ public class ItemProcessor {
         }
     }
 
-    public void storeOriginalExchange(Exchange exchange) {
-        exchange.setProperty("originalExchange", exchange.getIn().copy());
-        logger.debug("Stored original exchange for currentTs: {}", exchange.getProperty("currentTs"));
-    }
-
-    public void restoreOriginalExchange(Exchange exchange) {
-        Exchange original = exchange.getProperty("originalExchange", Exchange.class);
-        if (original != null) {
-            exchange.getIn().setBody(original.getIn().getBody());
-            exchange.getProperties().putAll(original.getProperties());
-            logger.debug("Restored original exchange for currentTs: {}", exchange.getProperty("currentTs"));
-        } else {
-            logger.warn("No original exchange to restore for currentTs: {}", exchange.getProperty("currentTs"));
-        }
-    }
-
-    public void validateCategoryResult(Exchange exchange) {
-        Object body = exchange.getIn().getBody();
-        String itemId = exchange.getProperty("itemId", String.class);
-        logger.debug("validateCategoryResult for item {}: body type={}, value={}",
-                itemId, body != null ? body.getClass().getName() : "null", body);
-        if (body instanceof List) {
-            logger.warn("Unexpected findOneByQuery result type: List, value: {}, setting to null for item {}", body, itemId);
-            exchange.getIn().setBody(null);
-        }
-    }
-
     public void enrichWithCategory(Exchange exchange) {
         Document item = exchange.getIn().getBody(Document.class);
         if (item != null) {
@@ -179,6 +153,18 @@ public class ItemProcessor {
         } else {
             logger.warn("Item is null in enrichWithCategory");
             exchange.setProperty("category", new Document("categoryName", "Unknown"));
+        }
+    }
+
+    public void validateCategoryResult(Exchange exchange) {
+        Object body = exchange.getIn().getBody();
+        String itemId = exchange.getProperty("itemId", String.class);
+        if (body == null || !(body instanceof Document)) {
+            logger.warn("Category query result for item {} is null or not a Document, setting default", itemId);
+            exchange.setProperty("category", new Document("categoryName", "Unknown"));
+            exchange.getIn().setBody(new Document("categoryName", "Unknown"));
+        } else {
+            logger.debug("Validated category result for item {}: {}", itemId, ((Document) body).toJson());
         }
     }
 
@@ -329,5 +315,49 @@ public class ItemProcessor {
         exchange.getIn().setHeader("CamelFileName", String.format("review-%s.xml", itemId));
         exchange.getIn().setBody(reviewXml);
         logger.debug("Prepared review XML for item: {}", reviewXml.getItemId());
+    }
+
+    public void storeOriginalExchange(Exchange exchange) {
+        exchange.setProperty("originalExchangeBody", exchange.getIn().getBody());
+        exchange.setProperty("originalExchangeHeaders", new HashMap<>(exchange.getIn().getHeaders()));
+        logger.debug("Stored original exchange for currentTs: {}", exchange.getProperty("currentTs"));
+    }
+
+    public void restoreOriginalExchange(Exchange exchange) {
+        Object originalBody = exchange.getProperty("originalExchangeBody");
+        Map<String, Object> originalHeaders = exchange.getProperty("originalExchangeHeaders", Map.class);
+        if (originalBody != null) {
+            exchange.getIn().setBody(originalBody);
+        }
+        if (originalHeaders != null) {
+            exchange.getIn().getHeaders().clear();
+            exchange.getIn().getHeaders().putAll(originalHeaders);
+        }
+        logger.debug("Restored original exchange for currentTs: {}", exchange.getProperty("currentTs"));
+    }
+
+    public void checkFileExistence(Exchange exchange) {
+        String fileName = exchange.getIn().getHeader("CamelFileName", String.class);
+        String outputFolder = exchange.getIn().getHeader("OutputFolder", String.class);
+        String propertyKey;
+        switch (outputFolder) {
+            case "trend":
+                propertyKey = "{{app.output.item-trend-analyzer}}";
+                break;
+            case "review":
+                propertyKey = "{{app.output.item-review-aggregator}}";
+                break;
+            case "store":
+                propertyKey = "{{app.output.storefront-app}}";
+                break;
+            default:
+                logger.error("Invalid OutputFolder: {}", outputFolder);
+                throw new IllegalArgumentException("Invalid OutputFolder: " + outputFolder);
+        }
+        String resolvedPath = exchange.getContext().resolvePropertyPlaceholders(propertyKey);
+        String fullPath = resolvedPath + "/" + fileName;
+        boolean fileExists = Files.exists(Paths.get(fullPath));
+        exchange.setProperty("fileExisted", fileExists);
+        logger.debug("Checked file existence for {}: {}", fullPath, fileExists);
     }
 }

@@ -13,16 +13,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.nio.file.Files;
-import java.nio.file.Paths;
-
 @Component
 public class ItemLimitRoute extends RouteBuilder {
     private static final Logger logger = LoggerFactory.getLogger(ItemLimitRoute.class);
 
     @Override
     public void configure() throws Exception {
-        // Global exception handling at the very top
+        // Global exception handling
         onException(Exception.class)
                 .handled(true)
                 .log(LoggingLevel.ERROR, "Route failed: ${exception.message}, stacktrace: ${exception.stacktrace}, itemId: ${exchangeProperty.itemId}, currentTs: ${exchangeProperty.currentTs}")
@@ -135,21 +132,7 @@ public class ItemLimitRoute extends RouteBuilder {
                 .routeId("writeToFile")
                 .doTry()
                 .throttle(100).timePeriodMillis(60000).asyncDelayed()
-                .process(exchange -> {
-                    String fileName = exchange.getIn().getHeader("CamelFileName", String.class);
-                    String outputFolder = exchange.getIn().getHeader("OutputFolder", String.class);
-                    String basePath = switch (outputFolder) {
-                        case "trend" -> "{{app.output.item-trend-analyzer}}";
-                        case "review" -> "{{app.output.item-review-aggregator}}";
-                        case "store" -> "{{app.output.storefront-app}}";
-                        default -> throw new IllegalArgumentException("Invalid OutputFolder: " + outputFolder);
-                    };
-                    String resolvedPath = getContext().resolvePropertyPlaceholders(basePath);
-                    String fullPath = resolvedPath + "/" + fileName;
-                    boolean fileExists = Files.exists(Paths.get(fullPath));
-                    exchange.setProperty("fileExisted", fileExists);
-                    logger.debug("Checked file existence for {}: {}", fullPath, fileExists);
-                })
+                .bean("itemProcessor", "checkFileExistence")
                 .choice()
                 .when(simple("${header.OutputFolder} == 'trend'"))
                 .to("file://{{app.output.item-trend-analyzer}}?fileName=${header.CamelFileName}&fileExist=Override")
