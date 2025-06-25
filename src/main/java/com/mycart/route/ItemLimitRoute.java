@@ -1,7 +1,7 @@
 package com.mycart.route;
-
 import org.apache.camel.LoggingLevel;
 import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.builder.DefaultErrorHandlerBuilder;
 import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.apache.camel.component.mongodb.MongoDbConstants;
 import org.apache.camel.converter.jaxb.JaxbDataFormat;
@@ -19,6 +19,22 @@ public class ItemLimitRoute extends RouteBuilder {
 
     @Override
     public void configure() throws Exception {
+        // Parse properties to correct types
+        int retryAttempts = Integer.parseInt(getContext().resolvePropertyPlaceholders("{{app.mongodb.retryAttempts}}"));
+        long initialDelay = Long.parseLong(getContext().resolvePropertyPlaceholders("{{app.mongodb.initialDelay}}"));
+        double backOffMultiplier = 3.0; // Hardcoded for 1 min, 3 min, 9 min approximation
+
+        // MongoDB retry error handler
+        DefaultErrorHandlerBuilder mongoErrorHandler = (DefaultErrorHandlerBuilder) new DefaultErrorHandlerBuilder()
+                .maximumRedeliveries(retryAttempts) // e.g., 3 retries
+                .redeliveryDelay(initialDelay) // Initial delay in ms (e.g., 60000 for 1 min)
+                .useExponentialBackOff() // Enable exponential backoff
+                .backOffMultiplier(backOffMultiplier) // Multiplier (approximates 1 min, 3 min, 9 min)
+                .retryAttemptedLogLevel(LoggingLevel.DEBUG)
+                .logRetryStackTrace(true)
+                .log("Retry attempt ${exchangeProperty.CamelRedeliveryCounter} for MongoDB operation: ${exception.message}")
+                .onRedelivery(exchange -> logger.debug("Redelivering MongoDB operation, attempt: ${exchangeProperty.CamelRedeliveryCounter}, error: ${exception.message}"));
+
         // Global exception handling
         onException(Exception.class)
                 .handled(true)
@@ -48,6 +64,7 @@ public class ItemLimitRoute extends RouteBuilder {
 
         from("direct:fetchControlRef")
                 .routeId("fetchControlRef")
+                .errorHandler(mongoErrorHandler)
                 .log(LoggingLevel.DEBUG, "Before fetching controlRef")
                 .setBody(constant(new Document("_id", "global")))
                 .log(LoggingLevel.DEBUG, "Set query for controlRef: ${body}")
@@ -57,6 +74,7 @@ public class ItemLimitRoute extends RouteBuilder {
 
         from("direct:processItems")
                 .routeId("processItems")
+                .errorHandler(mongoErrorHandler)
                 .doTry()
                 .bean("itemProcessor", "prepareItemQuery")
                 .log(LoggingLevel.DEBUG, "After prepareItemQuery, query: ${body}")
@@ -73,7 +91,7 @@ public class ItemLimitRoute extends RouteBuilder {
                 .log(LoggingLevel.DEBUG, "Processing item ${exchangeProperty.itemId}")
                 .bean("itemProcessor", "enrichWithCategory")
                 .log(LoggingLevel.DEBUG, "Executing category query for item ${exchangeProperty.itemId}, query: ${body}")
-                .to(mongoUri + "&collection={{app.category.collection}}&operation=findOneByQuery&outputType=Document")
+                .to("direct:fetchCategory") // Sub-route for retry
                 .bean("itemProcessor", "validateCategoryResult")
                 .bean("itemProcessor", "processCategoryQuery")
                 .bean("itemProcessor", "mapItemData")
@@ -127,6 +145,12 @@ public class ItemLimitRoute extends RouteBuilder {
                 .log(LoggingLevel.ERROR, "Failed processing items: ${exception.message}, currentTs: ${exchangeProperty.currentTs}")
                 .setProperty("itemsProcessed", constant(false))
                 .end();
+
+        // Category query sub-route with retry
+        from("direct:fetchCategory")
+                .routeId("fetchCategory")
+                .errorHandler(mongoErrorHandler)
+                .to(mongoUri + "&collection={{app.category.collection}}&operation=findOneByQuery&outputType=Document");
 
         from("direct:writeToFile")
                 .routeId("writeToFile")
@@ -199,6 +223,7 @@ public class ItemLimitRoute extends RouteBuilder {
 
         from("direct:updateControlRef")
                 .routeId("updateControlRef")
+                .errorHandler(mongoErrorHandler)
                 .log(LoggingLevel.DEBUG, "Starting controlRef update with currentTs: ${exchangeProperty.currentTs}")
                 .bean("controlRefProcessor", "updateControlRef")
                 .choice()
