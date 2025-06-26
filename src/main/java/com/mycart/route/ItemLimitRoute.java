@@ -1,10 +1,14 @@
 package com.mycart.route;
+
+import org.apache.camel.Exchange;
 import org.apache.camel.LoggingLevel;
 import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.builder.DefaultErrorHandlerBuilder;
 import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.apache.camel.component.mongodb.MongoDbConstants;
 import org.apache.camel.converter.jaxb.JaxbDataFormat;
+import com.mongodb.MongoSocketException;
+import com.mongodb.MongoTimeoutException;
 import com.mycart.model.ReviewXml;
 import com.mycart.model.StoreJson;
 import com.mycart.model.TrendXml;
@@ -19,6 +23,8 @@ public class ItemLimitRoute extends RouteBuilder {
 
     @Override
     public void configure() throws Exception {
+        String mongoUri = getContext().resolvePropertyPlaceholders("{{spring.mongodb.uri}}");
+        logger.info("Using MongoDB URI: {}", mongoUri);
         // Parse properties to correct types
         int retryAttempts = Integer.parseInt(getContext().resolvePropertyPlaceholders("{{app.mongodb.retryAttempts}}"));
         long initialDelay = Long.parseLong(getContext().resolvePropertyPlaceholders("{{app.mongodb.initialDelay}}"));
@@ -35,17 +41,27 @@ public class ItemLimitRoute extends RouteBuilder {
                 .log("Retry attempt ${exchangeProperty.CamelRedeliveryCounter} for MongoDB operation: ${exception.message}")
                 .onRedelivery(exchange -> logger.debug("Redelivering MongoDB operation, attempt: ${exchangeProperty.CamelRedeliveryCounter}, error: ${exception.message}"));
 
-        // Global exception handling
+        // Global exception handling for non-MongoDB exceptions
         onException(Exception.class)
                 .handled(true)
+                .choice()
+                .when(simple("${exception.classname} != 'com.mongodb.MongoTimeoutException' && ${exception.classname} != 'com.mongodb.MongoSocketException'"))
                 .log(LoggingLevel.ERROR, "Route failed: ${exception.message}, stacktrace: ${exception.stacktrace}, itemId: ${exchangeProperty.itemId}, currentTs: ${exchangeProperty.currentTs}")
-                .stop();
+                .stop()
+                .otherwise()
+                .process(exchange -> {
+                    Exception exception = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
+                    if (exception instanceof MongoTimeoutException || exception instanceof MongoSocketException) {
+                        throw exception;
+                    }
+                })
+                .endChoice();
 
         JaxbDataFormat trendXmlFormat = new JaxbDataFormat(TrendXml.class.getPackage().getName());
         JaxbDataFormat reviewXmlFormat = new JaxbDataFormat(ReviewXml.class.getPackage().getName());
         JacksonDataFormat jsonFormat = new JacksonDataFormat(StoreJson.class);
 
-        String mongoUri = "mongodb:mongoDbComponent?database={{app.mongodb.database}}";
+        mongoUri = "mongodb:mongoDbComponent?database={{app.mongodb.database}}";
 
         from("quartz://fileExport?cron={{app.scheduler.cron}}&stateful=true")
                 .routeId("fileExport")
@@ -75,7 +91,6 @@ public class ItemLimitRoute extends RouteBuilder {
         from("direct:processItems")
                 .routeId("processItems")
                 .errorHandler(mongoErrorHandler)
-                .doTry()
                 .bean("itemProcessor", "prepareItemQuery")
                 .log(LoggingLevel.DEBUG, "After prepareItemQuery, query: ${body}")
                 .setHeader(MongoDbConstants.LIMIT, constant(Integer.parseInt(getContext().resolvePropertyPlaceholders("{{app.records.processLimit}}"))))
@@ -91,7 +106,7 @@ public class ItemLimitRoute extends RouteBuilder {
                 .log(LoggingLevel.DEBUG, "Processing item ${exchangeProperty.itemId}")
                 .bean("itemProcessor", "enrichWithCategory")
                 .log(LoggingLevel.DEBUG, "Executing category query for item ${exchangeProperty.itemId}, query: ${body}")
-                .to("direct:fetchCategory") // Sub-route for retry
+                .to("direct:fetchCategory")
                 .bean("itemProcessor", "validateCategoryResult")
                 .bean("itemProcessor", "processCategoryQuery")
                 .bean("itemProcessor", "mapItemData")
@@ -139,14 +154,8 @@ public class ItemLimitRoute extends RouteBuilder {
                 .when(simple("${body} == null || ${body.size()} == 0"))
                 .setProperty("itemsProcessed", constant(false))
                 .log(LoggingLevel.INFO, "No valid items to process, skipping split")
-                .endChoice()
-                .endDoTry()
-                .doCatch(Exception.class)
-                .log(LoggingLevel.ERROR, "Failed processing items: ${exception.message}, currentTs: ${exchangeProperty.currentTs}")
-                .setProperty("itemsProcessed", constant(false))
-                .end();
+                .endChoice();
 
-        // Category query sub-route with retry
         from("direct:fetchCategory")
                 .routeId("fetchCategory")
                 .errorHandler(mongoErrorHandler)

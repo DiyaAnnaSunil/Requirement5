@@ -1,8 +1,10 @@
+
 package com.mycart.config;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import org.apache.camel.component.mongodb.MongoDbComponent;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.mongodb.core.MongoTemplate;
@@ -10,9 +12,12 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 @Configuration
 public class MongoConfig {
 
+    @Value("${spring.mongodb.uri}")
+    private String mongoUri;
+
     @Bean(name = "mongoClient")
     public MongoClient mongoClient() {
-        return MongoClients.create("mongodb://localhost:27017");
+        return MongoClients.create(mongoUri);
     }
 
     @Bean
@@ -20,7 +25,7 @@ public class MongoConfig {
         return new MongoTemplate(mongoClient, "cart");
     }
 
-    @Bean(name = "mongoClient")
+    @Bean(name = "mongoDbComponent")
     public MongoDbComponent mongoDbComponent(MongoClient mongoClient) {
         MongoDbComponent component = new MongoDbComponent();
         component.setMongoConnection(mongoClient);
