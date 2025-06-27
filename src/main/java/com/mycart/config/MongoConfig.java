@@ -1,4 +1,3 @@
-
 package com.mycart.config;
 
 import com.mongodb.client.MongoClient;
@@ -12,7 +11,7 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 @Configuration
 public class MongoConfig {
 
-    @Value("${spring.mongodb.uri}")
+    @Value("${app.mongodb.uri}")
     private String mongoUri;
 
     @Bean(name = "mongoClient")
